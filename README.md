@@ -95,6 +95,45 @@ You can set a `VERSION` environment variable to download a specific tag or versi
 
 ---
 
+## Uninstallation
+
+If you installed `gdcopy` using the quick installation scripts, you can completely uninstall it by following the instructions below for your platform.
+
+### macOS / Linux
+
+To remove the binary:
+```bash
+sudo rm /usr/local/bin/gdcopy
+```
+
+### Windows (PowerShell)
+
+Run the following commands in PowerShell to remove the installation directory and clean up your `PATH` environment variable:
+
+```powershell
+# 1. Remove the binary and directory
+Remove-Item -Recurse -Force "$HOME\.gdcopy"
+
+# 2. Remove from User PATH environment variable
+$installDir = "$HOME\.gdcopy"
+$userPath = [System.Environment]::GetEnvironmentVariable("PATH", "User")
+if ($userPath -like "*$installDir*") {
+    $newPath = ($userPath -split ";" | Where-Object { $_ -ne $installDir }) -join ";"
+    [System.Environment]::SetEnvironmentVariable("PATH", $newPath, "User")
+    Write-Host "Successfully removed $installDir from User PATH."
+}
+```
+*Note: Restart any open terminals/shells for the PATH changes to take effect.*
+
+### Cleaning Up Authentication Cache (All Platforms)
+
+`gdcopy` saves the encrypted OAuth credentials to `token.json` in the directory where the command is executed. If you wish to clear all cached credentials, locate and delete these `token.json` files:
+```bash
+rm token.json
+```
+
+---
+
 ### Command Line Options
 
 The tool supports the following command line flags:
