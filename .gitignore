@@ -1,0 +1,20 @@
+# Google Drive Credentials & Tokens (CRITICAL: Do not commit secrets)
+credentials*.json
+token*.json
+
+# Compiled Binaries
+gdcopy
+gdrive-cli-tool
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test Binaries
+*.test
+*.out
+
+# Operating System Files
+.DS_Store
+Thumbs.db
