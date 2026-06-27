@@ -27,7 +27,7 @@ jobs:
           VERSION="${{ github.ref_name }}"
           # Fallback if manual dispatch and not on a tag
           if [[ -z "$VERSION" || "$VERSION" == "main" || "$VERSION" == "master" ]]; then
-            VERSION="v1.0.0"
+            VERSION="v1.1.0"
           fi
           echo "VERSION=$VERSION" >> $GITHUB_ENV
           echo "Building version: $VERSION"

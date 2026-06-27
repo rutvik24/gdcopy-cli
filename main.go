@@ -14,8 +14,8 @@ import (
 
 // Version holds the current version of the tool.
 // This can be set at compile time using:
-// go build -ldflags "-X main.Version=v1.0.0"
-var Version = "v1.0.0"
+// go build -ldflags "-X main.Version=v1.1.0"
+var Version = "v1.1.0"
 
 func main() {
 	// Let user select or create a database path
