@@ -2,6 +2,7 @@ package ui
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"strconv"
@@ -21,6 +22,7 @@ type Location struct {
 
 // UIState maintains the state of the CLI application
 type UIState struct {
+	ctx          context.Context
 	srv          *gdrive.Service
 	pathStack    []Location
 	sourceFolder *drive.Folder
@@ -30,8 +32,9 @@ type UIState struct {
 }
 
 // NewUIState initializes a new UIState
-func NewUIState(srv *gdrive.Service) *UIState {
+func NewUIState(ctx context.Context, srv *gdrive.Service) *UIState {
 	return &UIState{
+		ctx: ctx,
 		srv: srv,
 		pathStack: []Location{
 			{ID: "main_root", Name: "Home", IsVirtual: true},
@@ -166,6 +169,16 @@ func (ui *UIState) buildMainMenu() []MenuItem {
 		})
 	}
 
+	// Check for interrupted uploads
+	if incompleteSessions, err := drive.GetIncompleteSessions(); err == nil && len(incompleteSessions) > 0 {
+		items = append(items, MenuItem{
+			Label: fmt.Sprintf("[Resume interrupted upload (%d sessions)]", len(incompleteSessions)),
+			Action: func() {
+				ui.handleResumeUploadMenu(incompleteSessions)
+			},
+		})
+	}
+
 	items = append(items, MenuItem{
 		Label: "Exit",
 		Action: func() {
@@ -270,6 +283,23 @@ func (ui *UIState) buildFolderMenu(curr Location) ([]MenuItem, error) {
 			ui.handleCreateFolder(curr.ID)
 		},
 	})
+
+	items = append(items, MenuItem{
+		Label: "-> UPLOAD a local file or folder to this folder",
+		Action: func() {
+			ui.handleUploadLocalPath(curr.ID)
+		},
+	})
+
+	// Check for interrupted uploads
+	if incompleteSessions, err := drive.GetIncompleteSessions(); err == nil && len(incompleteSessions) > 0 {
+		items = append(items, MenuItem{
+			Label: fmt.Sprintf("-> RESUME interrupted upload (%d sessions pending)", len(incompleteSessions)),
+			Action: func() {
+				ui.handleResumeUploadMenu(incompleteSessions)
+			},
+		})
+	}
 
 	// Add Back option
 	items = append(items, MenuItem{
@@ -834,4 +864,131 @@ func (ui *UIState) handleSelectFilesAsSource(folderID string) {
 			cursorPos = idx
 		}
 	}
+}
+
+// handleUploadLocalPath prompts the user for local paths and session name, and starts the upload session
+func (ui *UIState) handleUploadLocalPath(parentFolderID string) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		homeDir = "."
+	}
+
+	// 1. Select local paths interactively starting from current machine user's home dir
+	localPaths, err := SelectLocalPath(homeDir, false)
+	if err != nil {
+		fmt.Printf("Upload cancelled: %v\n", err)
+		return
+	}
+
+	// 2. Ask for a session name for identification
+	namePrompt := promptui.Prompt{
+		Label: "Enter a name for this upload session (for tracking/resuming)",
+		Validate: func(input string) error {
+			if strings.TrimSpace(input) == "" {
+				return fmt.Errorf("session name cannot be empty")
+			}
+			return nil
+		},
+	}
+
+	sessionName, err := namePrompt.Run()
+	if err != nil {
+		fmt.Println("Upload cancelled.")
+		return
+	}
+
+	fmt.Printf("\nPreparing upload for %d item(s)...\n", len(localPaths))
+	sessionID, err := drive.StartNewUploadSession(ui.srv, sessionName, localPaths, parentFolderID)
+	if err != nil {
+		fmt.Printf("Error preparing upload: %v\n", err)
+		if ui.ctx.Err() != nil {
+			ui.shouldExit = true
+			return
+		}
+		ui.pressEnterToContinue()
+		return
+	}
+
+	fmt.Printf("Starting upload session %d: '%s'...\n", sessionID, sessionName)
+	err = drive.RunUploadSession(ui.ctx, ui.srv, sessionID, func(msg string) {
+		fmt.Println(" >", msg)
+	})
+	if err != nil {
+		fmt.Printf("\nUpload interrupted/failed: %v\n", err)
+		if ui.ctx.Err() == nil {
+			fmt.Println("You can resume this upload later from the main menu or this folder.")
+		}
+	} else {
+		fmt.Println("\nUpload completed successfully!")
+	}
+
+	if ui.ctx.Err() != nil {
+		ui.shouldExit = true
+		return
+	}
+	ui.pressEnterToContinue()
+}
+
+// handleResumeUploadMenu displays a selection menu for incomplete sessions and resumes the chosen one
+func (ui *UIState) handleResumeUploadMenu(sessions []drive.UploadSession) {
+	type SessionOption struct {
+		Label string
+		ID    int64
+	}
+
+	var options []SessionOption
+	for _, s := range sessions {
+		files, err := drive.GetSessionFiles(s.ID)
+		total := len(files)
+		uploaded := 0
+		if err == nil {
+			for _, f := range files {
+				if f.Status == "uploaded" {
+					uploaded++
+				}
+			}
+		}
+		
+		options = append(options, SessionOption{
+			Label: fmt.Sprintf("%s (%d/%d uploaded, created: %s)", s.Name, uploaded, total, s.CreatedAt.Format("2006-01-02 15:04")),
+			ID:    s.ID,
+		})
+	}
+
+	options = append(options, SessionOption{Label: "[Back]", ID: -1})
+
+	prompt := promptui.Select{
+		Label: "Select an incomplete upload session to resume",
+		Items: options,
+		Templates: &promptui.SelectTemplates{
+			Label:    "{{ . }}",
+			Active:   "\U0001F449 {{ .Label | cyan }}",
+			Inactive: "   {{ .Label }}",
+			Selected: "\U0001F449 {{ .Label | green | bold }}",
+		},
+	}
+
+	idx, _, err := prompt.Run()
+	if err != nil || options[idx].ID == -1 {
+		return
+	}
+
+	sessionID := options[idx].ID
+	
+	fmt.Printf("\nResuming upload session %d...\n", sessionID)
+	
+	err = drive.RunUploadSession(ui.ctx, ui.srv, sessionID, func(msg string) {
+		fmt.Println(" >", msg)
+	})
+	if err != nil {
+		fmt.Printf("\nUpload interrupted/failed: %v\n", err)
+	} else {
+		fmt.Printf("\nUpload session %d completed successfully!\n", sessionID)
+	}
+
+	if ui.ctx.Err() != nil {
+		ui.shouldExit = true
+		return
+	}
+	ui.pressEnterToContinue()
 }

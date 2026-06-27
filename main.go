@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -17,19 +18,38 @@ import (
 var Version = "v1.0.0"
 
 func main() {
+	// Let user select or create a database path
+	dbPath, err := selectDatabasePath()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\n[Database Setup Error] %v\n", err)
+		os.Exit(1)
+	}
+
+	// Initialize SQLite DB for upload tracking
+	if err := drive.InitDB(dbPath); err != nil {
+		fmt.Fprintf(os.Stderr, "\n[Database Error] %v\n", err)
+		os.Exit(1)
+	}
+	defer drive.CloseDB()
+
+	// Set up cancellable context for graceful termination
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// Set up channel to capture termination signals (like Ctrl+C / SIGINT or SIGTERM)
 	cleanupChan := make(chan os.Signal, 1)
 	signal.Notify(cleanupChan, os.Interrupt, syscall.SIGTERM)
 
-	// Make sure we cleanup the token file when the program exits normally
-	defer drive.CleanupToken()
-
 	// Capture interrupt signal in a goroutine to clean up and exit
 	go func() {
 		<-cleanupChan
-		drive.CleanupToken()
-		fmt.Println("\nProcess terminated. Secure token cleaned up.")
-		os.Exit(0)
+		fmt.Println("\nProcess termination signal received. Cleaning up active uploads...")
+		cancel()
+
+		// A second interrupt signal will force immediate exit
+		<-cleanupChan
+		fmt.Println("\nForced exit.")
+		os.Exit(1)
 	}()
 
 	// Parse CLI flags
@@ -67,6 +87,22 @@ func main() {
 	}
 
 	// 2. Start the interactive terminal UI
-	uiState := ui.NewUIState(srv)
+	uiState := ui.NewUIState(ctx, srv)
 	uiState.Run()
+}
+
+// selectDatabasePath prompts the user to select an existing .db file or input a new one starting from the user's home directory.
+func selectDatabasePath() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		homeDir = "."
+	}
+	paths, err := ui.SelectLocalPath(homeDir, true)
+	if err != nil {
+		return "", err
+	}
+	if len(paths) == 0 {
+		return "", fmt.Errorf("no database file selected")
+	}
+	return paths[0], nil
 }

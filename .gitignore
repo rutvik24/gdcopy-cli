@@ -1,6 +1,9 @@
 # Google Drive Credentials & Tokens (CRITICAL: Do not commit secrets)
 credentials*.json
 token*.json
+*.db
+gdcopy_uploads.db
+
 
 # Compiled Binaries
 gdcopy

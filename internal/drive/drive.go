@@ -1,12 +1,17 @@
 package drive
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/manifoldco/promptui"
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/googleapi"
 )
@@ -636,3 +641,495 @@ func executeWithRetry[T any](operation func() (T, error)) (T, error) {
 	}
 	return result, err
 }
+
+// UploadFileToDrive uploads a local file to a Google Drive folder.
+func UploadFileToDrive(ctx context.Context, srv *drive.Service, localFilePath string, driveFileName string, parentFolderID string) (*drive.File, error) {
+	driveFile := &drive.File{
+		Name:    driveFileName,
+		Parents: []string{parentFolderID},
+	}
+
+	return executeWithRetry(func() (*drive.File, error) {
+		f, err := os.Open(localFilePath)
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+
+		return srv.Files.Create(driveFile).Media(f).Context(ctx).Do()
+	})
+}
+
+// StartNewUploadSession initializes a new upload session, creates DB records, and returns the session ID.
+func StartNewUploadSession(srv *drive.Service, name string, localPaths []string, destFolderID string) (int64, error) {
+	pathsJSON, err := json.Marshal(localPaths)
+	if err != nil {
+		return 0, fmt.Errorf("failed to marshal local paths: %v", err)
+	}
+
+	sessionID, err := CreateUploadSession(name, string(pathsJSON), destFolderID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create upload session in DB: %v", err)
+	}
+
+	for _, localPath := range localPaths {
+		fi, err := os.Stat(localPath)
+		if err != nil {
+			_ = UpdateSessionStatus(sessionID, "failed")
+			return 0, fmt.Errorf("local path error: %v", err)
+		}
+
+		if fi.IsDir() {
+			parentDir := filepath.Dir(localPath)
+			err = filepath.Walk(localPath, func(path string, info os.FileInfo, walkErr error) error {
+				if walkErr != nil {
+					return walkErr
+				}
+
+				relPath, err := filepath.Rel(parentDir, path)
+				if err != nil {
+					return err
+				}
+
+				if info.IsDir() {
+					driveFolderID, found := FindCreatedFolder(destFolderID, relPath)
+					if !found {
+						driveFolderID = ""
+					}
+					_, err = AddFolderToSession(sessionID, relPath, driveFolderID)
+					return err
+				} else {
+					parentRelPath := filepath.Dir(relPath)
+					if parentRelPath == "." {
+						parentRelPath = ""
+					}
+					driveFileID, found := FindUploadedFile(destFolderID, relPath, info.Size())
+					status := "pending"
+					if found {
+						status = "uploaded"
+					} else {
+						driveFileID = ""
+					}
+					_, err = AddFileToSession(sessionID, path, relPath, parentRelPath, info.Size(), status, driveFileID)
+					return err
+				}
+			})
+			if err != nil {
+				_ = UpdateSessionStatus(sessionID, "failed")
+				return 0, fmt.Errorf("failed walking local folder %s: %v", localPath, err)
+			}
+		} else {
+			// Single file upload
+			relPath := filepath.Base(localPath)
+			driveFileID, found := FindUploadedFile(destFolderID, relPath, fi.Size())
+			status := "pending"
+			if found {
+				status = "uploaded"
+			} else {
+				driveFileID = ""
+			}
+			_, err = AddFileToSession(sessionID, localPath, relPath, "", fi.Size(), status, driveFileID)
+			if err != nil {
+				_ = UpdateSessionStatus(sessionID, "failed")
+				return 0, fmt.Errorf("failed to register file in session DB: %v", err)
+			}
+		}
+	}
+
+	return sessionID, nil
+}
+
+// RunUploadSession runs/resumes an upload session.
+func RunUploadSession(ctx context.Context, srv *drive.Service, sessionID int64, logFunc func(string)) error {
+	// 1. Get session info
+	var session UploadSession
+	err := DB.QueryRow("SELECT id, name, local_path, dest_folder_id, status FROM upload_sessions WHERE id = ?", sessionID).
+		Scan(&session.ID, &session.Name, &session.LocalPath, &session.DestFolderID, &session.Status)
+	if err != nil {
+		return fmt.Errorf("failed to fetch session: %v", err)
+	}
+
+	if session.Status == "completed" {
+		logFunc("Session already completed.")
+		return nil
+	}
+
+	var driveFolderMap = make(map[string]string) // relative_path -> drive_folder_id
+
+	// 2. Load folders and create missing ones
+	folders, err := GetSessionFolders(sessionID)
+	if err != nil {
+		return fmt.Errorf("failed to fetch session folders: %v", err)
+	}
+
+	if len(folders) > 0 {
+		// Sort folders by depth of relative_path (root "" first)
+		sort.Slice(folders, func(i, j int) bool {
+			cI := strings.Count(folders[i].RelativePath, "/")
+			cJ := strings.Count(folders[j].RelativePath, "/")
+			if folders[i].RelativePath == "" {
+				return true
+			}
+			if folders[j].RelativePath == "" {
+				return false
+			}
+			return cI < cJ
+		})
+
+		// Create folders on Google Drive
+		for i, f := range folders {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
+			if f.DriveFolderID != "" {
+				driveFolderMap[f.RelativePath] = f.DriveFolderID
+				continue
+			}
+
+			var folderName string
+			var parentDriveID string
+
+			if f.RelativePath == "" {
+				var paths []string
+				if json.Unmarshal([]byte(session.LocalPath), &paths) == nil && len(paths) > 0 {
+					folderName = filepath.Base(paths[0])
+				} else {
+					folderName = filepath.Base(session.LocalPath)
+				}
+				parentDriveID = session.DestFolderID
+			} else {
+				folderName = filepath.Base(f.RelativePath)
+				parentRelPath := filepath.Dir(f.RelativePath)
+				if parentRelPath == "." {
+					parentRelPath = ""
+				}
+				if parentRelPath == "" {
+					parentDriveID = session.DestFolderID
+				} else {
+					parentDriveID = driveFolderMap[parentRelPath]
+					if parentDriveID == "" {
+						return fmt.Errorf("parent folder Drive ID not found for: %s", f.RelativePath)
+					}
+				}
+			}
+
+			logFunc(fmt.Sprintf("Creating folder on Drive: %s ...", f.RelativePath))
+			newFolder, err := CreateFolder(srv, folderName, parentDriveID)
+			if err != nil {
+				return fmt.Errorf("failed to create folder '%s' on Drive: %v", f.RelativePath, err)
+			}
+
+			err = UpdateFolderDriveID(sessionID, f.RelativePath, newFolder.Id)
+			if err != nil {
+				return fmt.Errorf("failed to update folder in DB: %v", err)
+			}
+
+			folders[i].DriveFolderID = newFolder.Id
+			driveFolderMap[f.RelativePath] = newFolder.Id
+		}
+	}
+
+	// 3. Load files and upload pending ones
+	files, err := GetSessionFiles(sessionID)
+	if err != nil {
+		return fmt.Errorf("failed to fetch session files: %v", err)
+	}
+
+	var pendingFiles []UploadFile
+	for _, f := range files {
+		if f.Status != "uploaded" {
+			pendingFiles = append(pendingFiles, f)
+		}
+	}
+
+	if len(pendingFiles) == 0 {
+		// All files uploaded, mark session as completed
+		err = UpdateSessionStatus(sessionID, "completed")
+		if err != nil {
+			return fmt.Errorf("failed to mark session completed: %v", err)
+		}
+		logFunc("All files successfully uploaded.")
+		// Recheck if all files are uploaded now
+		reloadedFiles, err := GetSessionFiles(sessionID)
+		if err == nil {
+			allDone := true
+			for _, rf := range reloadedFiles {
+				if rf.Status != "uploaded" {
+					allDone = false
+					break
+				}
+			}
+			if allDone {
+				_ = UpdateSessionStatus(sessionID, "completed")
+				logFunc("All files successfully uploaded.")
+				return nil
+			}
+		}
+	}
+	logFunc(fmt.Sprintf("Found %d pending file(s) to upload.", len(pendingFiles)))
+
+	// Cache of files existing in destination folders on Drive: parentID -> name -> File info
+	destFilesCache := make(map[string]map[string]*drive.File)
+	var verifiedPendingFiles []UploadFile
+
+	for _, fRec := range pendingFiles {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		// Determine target parent folder ID
+		var targetParentID string
+		if fRec.DestFolderRelativePath != "" {
+			targetParentID = driveFolderMap[fRec.DestFolderRelativePath]
+		} else {
+			targetParentID = session.DestFolderID
+		}
+
+		if targetParentID == "" {
+			// Parent folder not created or not found, keep in queue (will fail during upload)
+			verifiedPendingFiles = append(verifiedPendingFiles, fRec)
+			continue
+		}
+
+		// Load cache for this parent folder if not cached yet
+		if destFilesCache[targetParentID] == nil {
+			logFunc(fmt.Sprintf("Scanning destination folder (ID: %s) for existing files...", targetParentID))
+			driveFiles, err := ListFilesAndFolders(srv, targetParentID)
+			if err != nil {
+				logFunc(fmt.Sprintf("Warning: failed to scan destination folder: %v", err))
+				destFilesCache[targetParentID] = make(map[string]*drive.File)
+			} else {
+				cache := make(map[string]*drive.File)
+				for _, df := range driveFiles {
+					if df.MimeType != "application/vnd.google-apps.folder" {
+						cache[df.Name] = df
+					}
+				}
+				destFilesCache[targetParentID] = cache
+			}
+		}
+
+		fileName := filepath.Base(fRec.LocalPath)
+		if df, exists := destFilesCache[targetParentID][fileName]; exists {
+			// File exists in Drive! Compare sizes
+			if df.Size == fRec.Size {
+				logFunc(fmt.Sprintf("File '%s' already exists on Drive with matching size (%d B). Skipping upload and updating database.", fRec.RelativePath, fRec.Size))
+				err = UpdateFileStatus(fRec.ID, "uploaded", df.Id, "")
+				if err != nil {
+					logFunc(fmt.Sprintf("Failed to update status in DB for %s: %v", fRec.RelativePath, err))
+				}
+				continue
+			} else {
+				// Size mismatch! Prompt the user
+				logFunc(fmt.Sprintf("\n[Collision] File '%s' already exists on Drive but size differs!", fRec.RelativePath))
+				logFunc(fmt.Sprintf("  Local Size: %d B", fRec.Size))
+				logFunc(fmt.Sprintf("  Drive Size: %d B", df.Size))
+
+				prompt := promptui.Select{
+					Label: fmt.Sprintf("Choose action for '%s'", fileName),
+					Items: []string{
+						"Replace (Delete the file on Drive and upload the local one)",
+						"Keep both (Upload the local file anyway, keeping the existing one)",
+						"Skip (Do not upload the local file, mark as uploaded in DB)",
+					},
+				}
+
+				idx, _, err := prompt.Run()
+				if err != nil {
+					if err == promptui.ErrInterrupt {
+						return fmt.Errorf("interrupted by user")
+					}
+					logFunc("Prompt error. Skipping file.")
+					continue
+				}
+
+				switch idx {
+				case 0:
+					// Replace: Delete existing file
+					logFunc(fmt.Sprintf("Deleting existing file '%s' (ID: %s) on Drive...", fileName, df.Id))
+					_, delErr := executeWithRetry(func() (interface{}, error) {
+						err := srv.Files.Delete(df.Id).Context(ctx).Do()
+						return nil, err
+					})
+					if delErr != nil {
+						logFunc(fmt.Sprintf("Error deleting existing file: %v. Proceeding to upload anyway...", delErr))
+					} else {
+						// Remove from cache
+						delete(destFilesCache[targetParentID], fileName)
+					}
+					verifiedPendingFiles = append(verifiedPendingFiles, fRec)
+				case 1:
+					// Keep both: proceed to upload
+					verifiedPendingFiles = append(verifiedPendingFiles, fRec)
+				case 2:
+					// Skip: update status in DB
+					logFunc(fmt.Sprintf("Skipping upload of '%s'. Updating database status.", fRec.RelativePath))
+					err = UpdateFileStatus(fRec.ID, "uploaded", df.Id, "")
+					if err != nil {
+						logFunc(fmt.Sprintf("Failed to update status in DB for %s: %v", fRec.RelativePath, err))
+					}
+				}
+			}
+		} else {
+			// File does not exist, upload it
+			verifiedPendingFiles = append(verifiedPendingFiles, fRec)
+		}
+	}
+
+	pendingFiles = verifiedPendingFiles
+
+	if len(pendingFiles) == 0 {
+		// Recheck if all files are uploaded now
+		reloadedFiles, err := GetSessionFiles(sessionID)
+		if err == nil {
+			allDone := true
+			for _, rf := range reloadedFiles {
+				if rf.Status != "uploaded" {
+					allDone = false
+					break
+				}
+			}
+			if allDone {
+				_ = UpdateSessionStatus(sessionID, "completed")
+				logFunc("All files successfully uploaded.")
+				return nil
+			}
+		}
+	}
+
+	// Upload files concurrently using a semaphore to control concurrency
+	concurrency := 4
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	var uploadErrMu sync.Mutex
+	var firstErr error
+
+	for _, fileRec := range pendingFiles {
+		if ctx.Err() != nil {
+			break
+		}
+
+		wg.Add(1)
+		go func(fRec UploadFile) {
+			defer wg.Done()
+
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			// If context is already cancelled, abort
+			if ctx.Err() != nil {
+				return
+			}
+
+			// Determine target parent folder ID
+			var targetParentID string
+			if fRec.DestFolderRelativePath != "" {
+				targetParentID = driveFolderMap[fRec.DestFolderRelativePath]
+				if targetParentID == "" {
+					errStr := fmt.Sprintf("target parent Drive ID not found for file %s", fRec.RelativePath)
+					logFunc("Error: " + errStr)
+					_ = UpdateFileStatus(fRec.ID, "failed", "", errStr)
+					uploadErrMu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf("%s", errStr)
+					}
+					uploadErrMu.Unlock()
+					return
+				}
+			} else {
+				targetParentID = session.DestFolderID
+			}
+
+			fileName := filepath.Base(fRec.LocalPath)
+			logFunc(fmt.Sprintf("Uploading file: %s ...", fRec.RelativePath))
+
+			dbUpdated := false
+			var driveFileID string
+
+			// Defer block to delete the file from Google Drive if it succeeded but failed to save in DB due to cancellation or error
+			defer func() {
+				if driveFileID != "" && !dbUpdated {
+					logFunc(fmt.Sprintf("Cleanup: Deleting uploaded file %s (ID: %s) due to interruption...", fRec.RelativePath, driveFileID))
+					cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer cleanupCancel()
+					_, deleteErr := executeWithRetry(func() (interface{}, error) {
+						err := srv.Files.Delete(driveFileID).Context(cleanupCtx).Do()
+						return nil, err
+					})
+					if deleteErr != nil {
+						logFunc(fmt.Sprintf("Cleanup Error: Failed to delete file %s from Drive: %v", fRec.RelativePath, deleteErr))
+					}
+				}
+			}()
+
+			res, err := UploadFileToDrive(ctx, srv, fRec.LocalPath, fileName, targetParentID)
+			if err != nil {
+				errMsg := err.Error()
+				logFunc(fmt.Sprintf("Failed uploading file %s: %v", fRec.RelativePath, err))
+				if ctx.Err() == nil {
+					_ = UpdateFileStatus(fRec.ID, "failed", "", errMsg)
+				}
+
+				uploadErrMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				uploadErrMu.Unlock()
+				return
+			}
+
+			driveFileID = res.Id
+
+			if ctx.Err() != nil {
+				return
+			}
+
+			// Successfully uploaded! Update status in DB
+			err = UpdateFileStatus(fRec.ID, "uploaded", driveFileID, "")
+			if err != nil {
+				logFunc(fmt.Sprintf("Failed to update status in DB for %s: %v", fRec.RelativePath, err))
+			} else {
+				dbUpdated = true
+				logFunc(fmt.Sprintf("Finished uploading: %s", fRec.RelativePath))
+			}
+		}(fileRec)
+	}
+
+	wg.Wait()
+
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	// Recheck if all files are uploaded now
+	reloadedFiles, err := GetSessionFiles(sessionID)
+	if err != nil {
+		return fmt.Errorf("failed to re-check session files: %v", err)
+	}
+
+	allDone := true
+	for _, rf := range reloadedFiles {
+		if rf.Status != "uploaded" {
+			allDone = false
+			break
+		}
+	}
+
+	if allDone {
+		err = UpdateSessionStatus(sessionID, "completed")
+		if err != nil {
+			return fmt.Errorf("failed to finalize session status: %v", err)
+		}
+		logFunc("Upload session completed successfully!")
+	} else {
+		logFunc("Upload session interrupted. Some files failed to upload.")
+		if firstErr != nil {
+			return firstErr
+		}
+		return fmt.Errorf("some files failed to upload")
+	}
+
+	return nil
+}
+

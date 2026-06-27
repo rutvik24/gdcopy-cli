@@ -27,10 +27,8 @@ import (
 	"google.golang.org/api/option"
 )
 
-// tokenCacheFile returns the path where the token should be saved.
-func tokenCacheFile() string {
-	return "token.json"
-}
+// legacyTokenFile is the old file-based token cache path, used only for migration.
+const legacyTokenFile = "token.json"
 
 func getEncryptionKey() ([]byte, error) {
 	hostname, _ := os.Hostname()
@@ -87,8 +85,23 @@ func decrypt(ciphertext []byte) ([]byte, error) {
 	return plaintext, nil
 }
 
-// tokenFromFile retrieves a token from a local file.
-func tokenFromFile(file string) (*oauth2.Token, error) {
+// tokenFromDB retrieves a token from the database.
+func tokenFromDB() (*oauth2.Token, error) {
+	cipherText, err := LoadOAuthToken()
+	if err != nil {
+		return nil, err
+	}
+	plainText, err := decrypt(cipherText)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt token (maybe key changed or data corrupted): %v", err)
+	}
+	tok := &oauth2.Token{}
+	err = json.Unmarshal(plainText, tok)
+	return tok, err
+}
+
+// tokenFromLegacyFile retrieves a token from the old file-based cache.
+func tokenFromLegacyFile(file string) (*oauth2.Token, error) {
 	cipherText, err := os.ReadFile(file)
 	if err != nil {
 		return nil, err
@@ -102,9 +115,8 @@ func tokenFromFile(file string) (*oauth2.Token, error) {
 	return tok, err
 }
 
-// saveToken saves a token to a file path.
-func saveToken(path string, token *oauth2.Token) error {
-	fmt.Printf("Saving credential file to: %s\n", path)
+// saveTokenToDB encrypts and saves a token to the database.
+func saveTokenToDB(token *oauth2.Token) error {
 	plainText, err := json.Marshal(token)
 	if err != nil {
 		return err
@@ -113,20 +125,31 @@ func saveToken(path string, token *oauth2.Token) error {
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
-	if err != nil {
-		return fmt.Errorf("unable to cache oauth token: %v", err)
+	if err := SaveOAuthToken(cipherText); err != nil {
+		return fmt.Errorf("unable to cache oauth token in database: %v", err)
 	}
-	defer f.Close()
-	_, err = f.Write(cipherText)
-	return err
+	return nil
 }
 
-// CleanupToken deletes the cached token file if it exists.
+// migrateLegacyTokenFile imports token.json into the database if present.
+func migrateLegacyTokenFile() (*oauth2.Token, error) {
+	tok, err := tokenFromLegacyFile(legacyTokenFile)
+	if err != nil {
+		return nil, err
+	}
+	if err := saveTokenToDB(tok); err != nil {
+		return nil, err
+	}
+	_ = os.Remove(legacyTokenFile)
+	fmt.Println("Migrated OAuth token from token.json to database.")
+	return tok, nil
+}
+
+// CleanupToken deletes the cached OAuth token from the database and legacy file.
 func CleanupToken() {
-	tokFile := tokenCacheFile()
-	if _, err := os.Stat(tokFile); err == nil {
-		_ = os.Remove(tokFile)
+	_ = DeleteOAuthToken()
+	if _, err := os.Stat(legacyTokenFile); err == nil {
+		_ = os.Remove(legacyTokenFile)
 	}
 }
 
@@ -150,7 +173,6 @@ func openBrowser(url string) {
 
 type savingTokenSource struct {
 	source  oauth2.TokenSource
-	tokFile string
 	lastTok *oauth2.Token
 	mu      sync.Mutex
 }
@@ -164,11 +186,10 @@ func (s *savingTokenSource) Token() (*oauth2.Token, error) {
 		return nil, err
 	}
 
-	// If the token is different (e.g. new AccessToken), save it to file
+	// If the token is different (e.g. new AccessToken), save it to the database
 	if s.lastTok == nil || tok.AccessToken != s.lastTok.AccessToken {
-		err := saveToken(s.tokFile, tok)
-		if err != nil {
-			fmt.Printf("Warning: failed to save refreshed token to %s: %v\n", s.tokFile, err)
+		if err := saveTokenToDB(tok); err != nil {
+			fmt.Printf("Warning: failed to save refreshed token to database: %v\n", err)
 		}
 		s.lastTok = tok
 	}
@@ -178,8 +199,10 @@ func (s *savingTokenSource) Token() (*oauth2.Token, error) {
 
 // getClient retrieves a token, saves it, and returns the generated client.
 func getClient(config *oauth2.Config) (*http.Client, error) {
-	tokFile := tokenCacheFile()
-	tok, err := tokenFromFile(tokFile)
+	tok, err := tokenFromDB()
+	if err != nil {
+		tok, err = migrateLegacyTokenFile()
+	}
 	if err != nil {
 		// Token not found or invalid, obtain new token via browser login
 		tok, err = getTokenFromWeb(config)
@@ -187,19 +210,19 @@ func getClient(config *oauth2.Config) (*http.Client, error) {
 			return nil, err
 		}
 
-		err = saveToken(tokFile, tok)
+		err = saveTokenToDB(tok)
 		if err != nil {
 			return nil, err
 		}
+		fmt.Println("OAuth token saved to database.")
 	}
 
 	// Create a token source that auto-refreshes using config
 	baseSource := config.TokenSource(context.Background(), tok)
 
-	// Wrap it in our savingTokenSource to auto-save to file when refreshed
+	// Wrap it in our savingTokenSource to auto-save to the database when refreshed
 	savingSource := &savingTokenSource{
 		source:  baseSource,
-		tokFile: tokFile,
 		lastTok: tok,
 	}
 
@@ -353,7 +376,8 @@ func GetDriveService(credPath string) (*drive.Service, error) {
 			}
 			credPath = result
 		case 1:
-			printCredentialsSetupInstructions(filepath.Dir(tokenCacheFile()))
+			cwd, _ := os.Getwd()
+			printCredentialsSetupInstructions(cwd)
 		case 2:
 			return nil, fmt.Errorf("credentials.json is required to run the Google Drive API service")
 		}
